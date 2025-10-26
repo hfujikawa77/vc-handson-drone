@@ -3,7 +3,7 @@ import argparse
 from pymavlink import mavutil
 
 # 接続文字列
-connection_string = 'tcp:127.0.0.1:5762'
+connection_string = 'tcp:127.0.0.1:5763'
 vehicle = None
 
 def connect_to_vehicle():
@@ -88,6 +88,11 @@ def goto_location(latitude, longitude, altitude):
         print("Vehicle not connected.")
         return
 
+    # Ensure vehicle is in GUIDED mode before moving
+    if not set_mode("GUIDED"):
+        print("Failed to set GUIDED mode. Cannot move.")
+        return
+
     print(f"Moving to Lat: {latitude}, Lon: {longitude}, Alt: {altitude}")
     vehicle.mav.set_position_target_global_int_send(
         0,       # time_boot_ms (not used)
@@ -125,11 +130,16 @@ def land_vehicle():
     print("Vehicle landed and disarmed.")
 
 def main():
+    print("""
++----------------------------------+
+|      Drone Control System        |
++----------------------------------+
+""")
     if not connect_to_vehicle():
         print("Exiting due to connection failure.")
         return
 
-    print("\nAvailable commands: arm, takeoff <altitude>, goto <lat> <lon> <alt>, land, mode <mode_name>, exit/quit")
+    print("\\nAvailable commands: arm, takeoff <altitude>, goto <lat> <lon> <alt>, land, mode <mode_name>, exit/quit")
     while True:
         try:
             command_line = input("Enter command > ").strip().split()
@@ -174,7 +184,7 @@ def main():
             else:
                 print("Unknown command. Available commands: arm, takeoff, goto, land, mode, exit/quit")
         except KeyboardInterrupt:
-            print("\nExiting application.")
+            print("\\nExiting application.")
             break
         except Exception as e:
             print(f"An error occurred: {e}")

@@ -70,12 +70,11 @@ async def set_mode(mode_name):
 
     mode_id = vehicle.mode_mapping()[mode_name]
     vehicle.set_mode(mode_id)
-    await asyncio.sleep(1) # Give it some time to change mode
+    # Don't sleep here. Let the mavlink_reader report the mode change.
     print(f"Mode change command sent for {mode_name}.")
     return True
 
 async def arm_vehicle():
-    global drone_status
     if not vehicle or not drone_connected:
         return
 
@@ -90,13 +89,11 @@ async def arm_vehicle():
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0,
         1, 0, 0, 0, 0, 0, 0)
-
-    await asyncio.sleep(5) # Give it some time to arm
-    drone_status["armed"] = True # Assuming success for now
-    print("Motors armed!")
+    # Don't sleep or assume success. The mavlink_reader will update the armed status
+    # based on HEARTBEAT messages from the drone.
+    print("Arm command sent.")
 
 async def takeoff_vehicle(altitude):
-    global drone_status
     if not vehicle or not drone_connected:
         return
 
@@ -111,12 +108,10 @@ async def takeoff_vehicle(altitude):
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
         0,
         0, 0, 0, 0, 0, 0, altitude)
-
-    await asyncio.sleep(10) # Give it some time to ascend
-    print("Takeoff complete.")
+    # Don't sleep. The mavlink_reader will report altitude changes.
+    print("Takeoff command sent.")
 
 async def land_vehicle():
-    global drone_status
     if not vehicle or not drone_connected:
         return
 
@@ -127,13 +122,15 @@ async def land_vehicle():
         mavutil.mavlink.MAV_CMD_NAV_LAND,
         0,
         0, 0, 0, 0, 0, 0, 0)
-
-    await asyncio.sleep(10) # Give it some time to land and disarm
-    drone_status["armed"] = False # Assuming disarmed after landing
-    print("Vehicle landed and disarmed.")
+    # Don't sleep. The mavlink_reader will report status changes.
+    print("Land command sent.")
 
 async def goto_location(latitude, longitude, altitude):
     if not vehicle or not drone_connected:
+        return
+
+    if not await set_mode("GUIDED"):
+        print("Failed to set GUIDED mode. Cannot go to location.")
         return
 
     print(f"Moving to Lat: {latitude}, Lon: {longitude}, Alt: {altitude}")
@@ -142,7 +139,7 @@ async def goto_location(latitude, longitude, altitude):
         vehicle.target_system,
         vehicle.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000, # type_mask (only speeds enabled)
+        0b0000111111111000, # type_mask (only position enabled)
         int(latitude * 1e7),
         int(longitude * 1e7),
         altitude,
@@ -151,9 +148,8 @@ async def goto_location(latitude, longitude, altitude):
         0,       # vz
         0, 0, 0, # afx, afy, afz (not used)
         0, 0)    # yaw, yaw_rate (not used)
-
-    await asyncio.sleep(15) # Give it some time to move
-    print("Movement complete.")
+    # Don't sleep. The mavlink_reader will report position changes.
+    print("Go-to command sent.")
 
 # --- WebSocket Endpoint ---
 @app.websocket("/ws")
@@ -169,36 +165,49 @@ async def websocket_endpoint(websocket: WebSocket):
             global drone_status
             loop = asyncio.get_event_loop()
             while True:
-                if vehicle and drone_connected:
-                    # Use run_in_executor to avoid blocking the event loop
-                    msg = await loop.run_in_executor(
-                        None, functools.partial(vehicle.recv_match, blocking=True)
-                    )
-                    if msg:
-                        # Update drone_status based on MAVLink messages
-                        if msg.get_type() == 'GLOBAL_POSITION_INT':
-                            drone_status["latitude"] = msg.lat / 1e7
-                            drone_status["longitude"] = msg.lon / 1e7
-                            drone_status["altitude"] = msg.alt / 1000.0 # mm to meters
-                            drone_status["heading"] = msg.hdg / 100.0 # centidegrees to degrees
-                        elif msg.get_type() == 'HEARTBEAT':
-                            # Armed status is derived from system_status
-                            is_armed = msg.system_status == mavutil.mavlink.MAV_STATE_ACTIVE
-                            drone_status["armed"] = is_armed
+                try:
+                    if vehicle and drone_connected:
+                        # Use run_in_executor to avoid blocking the event loop.
+                        # Add a timeout to recv_match to prevent it from blocking indefinitely,
+                        # which can cause websocket keepalive pings to fail.
+                        msg = await loop.run_in_executor(
+                            None, functools.partial(vehicle.recv_match, blocking=True, timeout=0.1)
+                        )
+                        if msg:
+                            # Update drone_status based on MAVLink messages
+                            if msg.get_type() == 'GLOBAL_POSITION_INT':
+                                drone_status["latitude"] = msg.lat / 1e7
+                                drone_status["longitude"] = msg.lon / 1e7
+                                drone_status["altitude"] = msg.alt / 1000.0 # mm to meters
+                                drone_status["heading"] = msg.hdg / 100.0 # centidegrees to degrees
+                            elif msg.get_type() == 'HEARTBEAT':
+                                # Armed status is derived from system_status
+                                is_armed = msg.system_status == mavutil.mavlink.MAV_STATE_ACTIVE
+                                drone_status["armed"] = is_armed
 
-                            # Reverse lookup for mode name from mode ID
-                            mode_name = "UNKNOWN"
-                            for name, mode_id_val in vehicle.mode_mapping().items():
-                                if mode_id_val == msg.custom_mode:
-                                    mode_name = name
-                                    break
-                            drone_status["mode"] = mode_name
+                                # Reverse lookup for mode name from mode ID
+                                mode_name = "UNKNOWN"
+                                for name, mode_id_val in vehicle.mode_mapping().items():
+                                    if mode_id_val == msg.custom_mode:
+                                        mode_name = name
+                                        break
+                                drone_status["mode"] = mode_name
 
-                        # Send updated status to frontend ONLY when there's a new message
-                        await websocket.send_json(drone_status)
-                else:
-                    # If not connected, wait a bit before checking again
-                    await asyncio.sleep(1)
+                            # Send updated status to frontend ONLY when there's a new message
+                            await websocket.send_json(drone_status)
+                        else:
+                            # No message received within the timeout, yield control briefly
+                            await asyncio.sleep(0.01)
+                    else:
+                        # If not connected, wait a bit before checking again
+                        await asyncio.sleep(1)
+                except WebSocketDisconnect:
+                    print("MAVLink reader: WebSocket disconnected, stopping task.")
+                    break  # Exit the loop if the socket is closed
+                except Exception as e:
+                    print(f"An error occurred in mavlink_reader: {e}")
+                    # If any other error occurs, log it and break the loop to be safe
+                    break
 
 
         reader_task = asyncio.create_task(mavlink_reader())

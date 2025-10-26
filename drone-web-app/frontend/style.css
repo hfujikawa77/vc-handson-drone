@@ -69,9 +69,50 @@ button:disabled {
     cursor: not-allowed;
 }
 
+.panels {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 20px;
+}
+
+.status-panel,
+.control-panel {
+    flex: 1;
+}
+
 #map {
-    height: 400px;
+    height: 600px;
     width: 100%;
     border: 1px solid #ddd;
     border-radius: 5px;
+}
+
+@media screen and (max-width: 768px) {
+    body {
+        padding: 10px;
+    }
+
+    h1 {
+        font-size: 1.5em;
+        word-wrap: break-word;
+    }
+
+    .container {
+        padding: 10px;
+    }
+
+    .command-group {
+        display: flex;
+        flex-direction: column;
+    }
+
+    input[type="number"], select {
+        width: calc(100% - 20px);
+        margin-bottom: 10px;
+    }
+
+    button {
+        width: 100%;
+        margin-top: 5px;
+    }
 }
