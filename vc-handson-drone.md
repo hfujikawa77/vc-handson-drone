@@ -19,7 +19,7 @@
 > ⚠️**CAUTION**  
 > グローバルインストール (`-g`) を行うため、管理者権限が必要な場合があります。
 
-## ドローン開発用
+## ドローンアプリ開発用
 | No. | ツール名 | 説明 | コマンド (PowerShell) |
 | --- | --- | --- | --- |
 | 1 | [Python](https://www.python.org/downloads/) | Pymavlink実行環境, v3.12以上推奨 | `winget install Python.Python.3.13` |
@@ -57,7 +57,7 @@ Tips for getting started:
 ## 要件定義
 1. Gemini CLIに下記プロンプトを入力して、要件定義書作成を指示する。
     ```powershell
-    ドローン制御アプリの要件定義書を drone-app/REQUIREMENTS.md として作成してください。Pythonを使い、Pymavlinkライブラリを使用してドローンと通信します。アーム（モーター開始）、離陸、座標指定移動、着陸を対話形式でコマンド実行できる機能を実装してください。Mission Plannerのシミュレーション環境（接続先:tcp:127.0.0.1:5762）で動作確認を行います。
+    ドローン制御CUIアプリの要件定義書を drone-app/REQUIREMENTS.md として作成してください。実装はまだ行わないでください。Pythonを使い、Pymavlinkライブラリを使用してドローンと通信します。アーム（モーター開始）、離陸、座標指定移動、着陸を対話形式でコマンド実行する機能を持ちます。Mission Plannerのシミュレーション環境（接続先:tcp:127.0.0.1:5762）で動作確認を行います。
     ```
     > 💡**TIPS**  
     > AIの作業を止めたい場合は`ESC`キーをクリックします。
