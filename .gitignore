@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# SITL / MAVProxy / ArduPilot ランタイム生成物
+mav.tlog
+mav.tlog.raw
+mav.parm
+*.tlog
+*.tlog.raw
+eeprom.bin
+*.BIN
+*.bin
+logs/
+terrain/
+*.log
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
