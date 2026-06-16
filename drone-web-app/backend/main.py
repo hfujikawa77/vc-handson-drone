@@ -1,7 +1,9 @@
-import asyncio
+import os
 import json
 import time
+import threading
 import functools
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,13 +11,22 @@ from pymavlink import mavutil
 
 app = FastAPI()
 
-# Mount static files for the frontend
-app.mount("/static", StaticFiles(directory="../frontend"), name="static")
+# フロントエンドの場所を CWD に依存せず解決する（コンテナでも確実に見つける）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
 
-# Drone connection global variables
-connection_string = 'tcp:127.0.0.1:5762'
+# 静的ファイル配信
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+# MAVLink 接続先は環境変数で切り替える（未指定なら BlueOS Extension 用の既定値）。
+#   WSL でローカルテスト  : MAV_ENDPOINT=tcp:127.0.0.1:5762
+#   BlueOS Extension(bridge): host.docker.internal 経由（既定）
+connection_string = os.environ.get("MAV_ENDPOINT", "udpout:host.docker.internal:14550")
+
 vehicle = None
 drone_connected = False
+# autopilot の機体タイプから明示的に作るモードマップ（Router 経由の取り違え対策）
+MODE_MAP = {}
 drone_status = {
     "connected": False,
     "armed": False,
@@ -26,189 +37,188 @@ drone_status = {
     "heading": 0,
 }
 
-# --- MAVLink Helper Functions (adapted from CLI app) ---
-async def request_data_streams():
-    if not vehicle or not drone_connected:
-        return
 
-    print("Requesting data streams...")
-    # Request position data stream at 10 Hz
-    vehicle.mav.request_data_stream_send(
-        vehicle.target_system,
-        vehicle.target_component,
-        mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-        10,  # Rate in Hz
-        1)   # Start sending
+# --- MAVLink 接続 ---
+def _recv_autopilot_heartbeat(v, timeout=10):
+    """autopilot（非GCS）の HEARTBEAT を返す。
+
+    MAVLink Router 経由では Mission Planner 等の GCS の HEARTBEAT も流れてくるため、
+    autopilot のものだけを採用する（これを誤ると機体特定・モードマップを取り違える）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hb = v.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+        if hb is None:
+            continue
+        if hb.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+            continue  # GCS / 非autopilot コンポーネントを除外
+        return hb
+    return None
+
 
 def connect_to_vehicle():
-    global vehicle, drone_connected
-    print(f"Attempting to connect to vehicle on: {connection_string}")
-    try:
-        vehicle = mavutil.mavlink_connection(connection_string, wait_heartbeat=True)
-        vehicle.wait_heartbeat()
-        print("Heartbeat from system (system %u component %u)" % (vehicle.target_system, vehicle.target_component))
-        drone_connected = True
-        drone_status["connected"] = True
-        # Request data streams after successful connection
-        asyncio.create_task(request_data_streams()) # Schedule as a task
-        return True
-    except Exception as e:
-        print(f"Failed to connect to vehicle: {e}")
-        drone_connected = False
-        drone_status["connected"] = False
-        return False
+    """接続が確立するまでリトライし続ける（起動順序に依存しない）。"""
+    global vehicle, drone_connected, MODE_MAP
+    while not drone_connected:
+        try:
+            print(f"Connecting to vehicle on: {connection_string}")
+            v = mavutil.mavlink_connection(connection_string)
+            # UDP Server(Router) はクライアントの最初のパケットを受けるまで送ってこないため、
+            # 先に heartbeat を送って自分のアドレスを登録させる。
+            v.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+            )
+            hb = _recv_autopilot_heartbeat(v)
+            if hb is None:
+                print("autopilot heartbeat not received, retrying...")
+                continue
+            v.target_system = hb.get_srcSystem()
+            v.target_component = hb.get_srcComponent()
+            # 機体タイプから明示的にモードマップを作る。
+            # v.mode_mapping() は「直近の HEARTBEAT」を見るため、Router 経由だと
+            # GCS や別機体を拾って誤ったマップ（例: Plane）を返すことがある。
+            MODE_MAP = mavutil.mode_mapping_byname(hb.type) or {}
+            # テレメトリのストリーム要求（直結TCPでは必須、Router 経由でも無害）
+            v.mav.request_data_stream_send(
+                v.target_system, v.target_component,
+                mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1
+            )
+            vehicle = v
+            drone_connected = True
+            drone_status["connected"] = True
+            print("Vehicle connected (system %u component %u, type %u)"
+                  % (v.target_system, v.target_component, hb.type))
+        except Exception as e:
+            print(f"Failed to connect to vehicle: {e}; retrying in 3s")
+            time.sleep(3)
 
+
+# --- コマンド ---
 async def set_mode(mode_name):
     if not vehicle or not drone_connected:
         return False
-
-    print(f"Setting mode to {mode_name}...")
-    if mode_name not in vehicle.mode_mapping():
-        print(f"Unknown mode: {mode_name}")
-        print("Available modes: ", list(vehicle.mode_mapping().keys()))
+    if mode_name not in MODE_MAP:
+        print(f"Unknown mode: {mode_name}; available: {list(MODE_MAP.keys())}")
         return False
-
-    mode_id = vehicle.mode_mapping()[mode_name]
-    vehicle.set_mode(mode_id)
-    # Don't sleep here. Let the mavlink_reader report the mode change.
+    vehicle.set_mode(MODE_MAP[mode_name])
     print(f"Mode change command sent for {mode_name}.")
     return True
+
 
 async def arm_vehicle():
     if not vehicle or not drone_connected:
         return
-
     if not await set_mode("GUIDED"):
         print("Failed to set GUIDED mode. Cannot arm.")
         return
-
     print("Arming motors...")
     vehicle.mav.command_long_send(
-        vehicle.target_system,
-        vehicle.target_component,
+        vehicle.target_system, vehicle.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0,
-        1, 0, 0, 0, 0, 0, 0)
-    # Don't sleep or assume success. The mavlink_reader will update the armed status
-    # based on HEARTBEAT messages from the drone.
+        0, 1, 0, 0, 0, 0, 0, 0)
     print("Arm command sent.")
+
 
 async def takeoff_vehicle(altitude):
     if not vehicle or not drone_connected:
         return
-
     if not await set_mode("GUIDED"):
         print("Failed to set GUIDED mode. Cannot takeoff.")
         return
-
     print(f"Taking off to altitude: {altitude} meters")
     vehicle.mav.command_long_send(
-        vehicle.target_system,
-        vehicle.target_component,
+        vehicle.target_system, vehicle.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0,
-        0, 0, 0, 0, 0, 0, altitude)
-    # Don't sleep. The mavlink_reader will report altitude changes.
+        0, 0, 0, 0, 0, 0, 0, altitude)
     print("Takeoff command sent.")
+
 
 async def land_vehicle():
     if not vehicle or not drone_connected:
         return
-
     print("Landing vehicle...")
     vehicle.mav.command_long_send(
-        vehicle.target_system,
-        vehicle.target_component,
+        vehicle.target_system, vehicle.target_component,
         mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0,
-        0, 0, 0, 0, 0, 0, 0)
-    # Don't sleep. The mavlink_reader will report status changes.
+        0, 0, 0, 0, 0, 0, 0, 0)
     print("Land command sent.")
+
 
 async def goto_location(latitude, longitude, altitude):
     if not vehicle or not drone_connected:
         return
-
     if not await set_mode("GUIDED"):
         print("Failed to set GUIDED mode. Cannot go to location.")
         return
-
     print(f"Moving to Lat: {latitude}, Lon: {longitude}, Alt: {altitude}")
     vehicle.mav.set_position_target_global_int_send(
-        0,       # time_boot_ms (not used)
-        vehicle.target_system,
-        vehicle.target_component,
+        0,
+        vehicle.target_system, vehicle.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000, # type_mask (only position enabled)
+        0b0000111111111000,
         int(latitude * 1e7),
         int(longitude * 1e7),
         altitude,
-        0,       # vx
-        0,       # vy
-        0,       # vz
-        0, 0, 0, # afx, afy, afz (not used)
-        0, 0)    # yaw, yaw_rate (not used)
-    # Don't sleep. The mavlink_reader will report position changes.
+        0, 0, 0,
+        0, 0, 0,
+        0, 0)
     print("Go-to command sent.")
 
-# --- WebSocket Endpoint ---
+
+# --- WebSocket ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected.")
     try:
-        # Send initial drone status
         await websocket.send_json(drone_status)
 
-        # Task to continuously read MAVLink messages and send status
         async def mavlink_reader():
             global drone_status
             loop = asyncio.get_event_loop()
             while True:
                 try:
                     if vehicle and drone_connected:
-                        # Use run_in_executor to avoid blocking the event loop.
-                        # Add a timeout to recv_match to prevent it from blocking indefinitely,
-                        # which can cause websocket keepalive pings to fail.
                         msg = await loop.run_in_executor(
                             None, functools.partial(vehicle.recv_match, blocking=True, timeout=0.1)
                         )
-                        if msg:
-                            # Update drone_status based on MAVLink messages
+                        # 接続した autopilot 以外（MAVProxy 等の GCS, 別機体・別コンポーネント）の
+                        # メッセージは無視する。これをしないと別システムの HEARTBEAT で
+                        # mode/armed が点滅する。
+                        if (msg
+                                and msg.get_srcSystem() == vehicle.target_system
+                                and msg.get_srcComponent() == vehicle.target_component):
                             if msg.get_type() == 'GLOBAL_POSITION_INT':
                                 drone_status["latitude"] = msg.lat / 1e7
                                 drone_status["longitude"] = msg.lon / 1e7
-                                drone_status["altitude"] = msg.alt / 1000.0 # mm to meters
-                                drone_status["heading"] = msg.hdg / 100.0 # centidegrees to degrees
+                                drone_status["altitude"] = msg.relative_alt / 1000.0
+                                drone_status["heading"] = msg.hdg / 100.0
+                                await websocket.send_json(drone_status)
                             elif msg.get_type() == 'HEARTBEAT':
-                                # Armed status is derived from system_status
-                                is_armed = msg.system_status == mavutil.mavlink.MAV_STATE_ACTIVE
-                                drone_status["armed"] = is_armed
-
-                                # Reverse lookup for mode name from mode ID
+                                # ARM 状態は base_mode の SAFETY_ARMED フラグで判定する
+                                drone_status["armed"] = bool(
+                                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                                )
+                                # custom_mode → モード名（autopilot のマップで逆引き）
                                 mode_name = "UNKNOWN"
-                                for name, mode_id_val in vehicle.mode_mapping().items():
+                                for name, mode_id_val in MODE_MAP.items():
                                     if mode_id_val == msg.custom_mode:
                                         mode_name = name
                                         break
                                 drone_status["mode"] = mode_name
-
-                            # Send updated status to frontend ONLY when there's a new message
-                            await websocket.send_json(drone_status)
+                                await websocket.send_json(drone_status)
                         else:
-                            # No message received within the timeout, yield control briefly
                             await asyncio.sleep(0.01)
                     else:
-                        # If not connected, wait a bit before checking again
+                        # 接続待ち（バックグラウンドで接続中）
+                        drone_status["connected"] = drone_connected
                         await asyncio.sleep(1)
                 except WebSocketDisconnect:
-                    print("MAVLink reader: WebSocket disconnected, stopping task.")
-                    break  # Exit the loop if the socket is closed
+                    break
                 except Exception as e:
                     print(f"An error occurred in mavlink_reader: {e}")
-                    # If any other error occurs, log it and break the loop to be safe
                     break
-
 
         reader_task = asyncio.create_task(mavlink_reader())
 
@@ -217,11 +227,10 @@ async def websocket_endpoint(websocket: WebSocket):
             command = json.loads(data)
             print(f"Received command: {command}")
 
-            # Handle commands from frontend
             if command["type"] == "connect":
-                if not drone_connected:
-                    connect_to_vehicle()
-                await websocket.send_json({"type": "status", "message": "Connection attempt initiated."})
+                # 接続はサーバ起動時に自動で行う。ここでは現在の状態を返すだけ。
+                await websocket.send_json({"type": "status",
+                                           "message": "connected" if drone_connected else "connecting..."})
             elif command["type"] == "arm":
                 await arm_vehicle()
                 await websocket.send_json({"type": "status", "message": "Arm command sent."})
@@ -251,17 +260,32 @@ async def websocket_endpoint(websocket: WebSocket):
         if 'reader_task' in locals() and not reader_task.done():
             reader_task.cancel()
 
-# --- HTTP Endpoint for Frontend ---
+
+# --- BlueOS Extension 連携 ---
+@app.get("/register_service")
+async def register_service():
+    # avoid_iframes=True: BlueOS は iframe 埋め込みではなく http://<IP>:<port>/ を直接開く。
+    # これにより WebSocket がリバースプロキシを経由せず直結でき、絶対パスもそのまま動く。
+    return {
+        "name": "Drone Web Control",
+        "description": "WebSocket + 地図によるドローン操作・監視パネル",
+        "icon": "mdi-drone",
+        "company": "",
+        "version": "1.0.0",
+        "webpage": "",
+        "api": "/docs",
+        "avoid_iframes": True,
+    }
+
+
+# --- フロントエンド配信 ---
 @app.get("/")
 async def get_frontend():
-    # Serve the index.html file from the frontend directory
-    with open("../frontend/index.html", "r", encoding="utf-8") as f:
+    with open(os.path.join(FRONTEND_DIR, "index.html"), "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
-# --- Startup Event ---
+
+# --- 起動時に自動接続（バックグラウンド・非ブロック） ---
 @app.on_event("startup")
 async def startup_event():
-    # Attempt to connect to the drone on startup
-    # For a real application, this might be triggered by a user action
-    # connect_to_vehicle() # Don't auto-connect, let frontend trigger it
-    pass
+    threading.Thread(target=connect_to_vehicle, daemon=True).start()
