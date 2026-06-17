@@ -74,16 +74,6 @@ Tips for getting started:
 6. AIの作業が完了したら、`drone-app/REQUIREMENTS.md` が作成されていることを確認する。必要に応じて手動で編集するか、AIに修正依頼する。
    * プロンプト例：`シミュレーション環境のみで動作すれば十分です。`, `実機での動作は考慮不要です。`
 
-## 依存ライブラリ定義
-1. Gemini CLIに下記プロンプトを入力して、依存ライブラリを定義したファイルを作成する。
-    ```powershell
-    drone-app/requirements.txt を作成して。pymavlinkライブラリを使用します。
-    ```
-2. ターミナルで下記コマンドを実行し、ライブラリをインストールする。
-    ```powershell
-    pip install -r drone-app/requirements.txt
-    ```
-
 ## 実装・テスト
 1. Mission Plannerを起動してシミュレーション環境を準備する。
    * Mission Planner起動後、上部メニューの `シミュレーション` ボタンをクリック
